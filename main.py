@@ -1,5 +1,5 @@
 # ============================================
-# 🚀 TOXIC - FAST CHAT API FOR VERCEL 🚀
+# 🚀 KAL-X - FAST CHAT API FOR VERCEL 🚀
 # Developer: Tomar Ji
 # Ready for Vercel Deployment
 # ============================================
@@ -24,7 +24,7 @@ from collections import defaultdict
 # ============================================
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'TOXIC-chat-api-2026'
+app.config['SECRET_KEY'] = 'KAL-X-chat-api-2026'
 CORS(app, origins='*')
 
 # Rate limiting
@@ -50,8 +50,7 @@ logger = logging.getLogger(__name__)
 
 def init_database():
     try:
-        # Use /tmp for Vercel (writable directory)
-        db_path = '/tmp/TOXIC_chat.db'
+        db_path = '/tmp/kalx_chat.db'
         if not os.path.exists(db_path):
             conn = sqlite3.connect(db_path)
             c = conn.cursor()
@@ -85,7 +84,6 @@ def get_db():
 # GEMINI API - OPTIMIZED
 # ============================================
 
-# Session cache for speed
 session_cache = {
     'data': None,
     'timestamp': 0,
@@ -152,7 +150,6 @@ def extract_build_and_session_params(html):
     return params
 
 def get_cached_session():
-    """Get cached session for speed"""
     current_time = time.time()
     if session_cache['data'] and (current_time - session_cache['timestamp']) < session_cache['ttl']:
         return session_cache['data']
@@ -316,11 +313,9 @@ def parse_streaming_response(response_text):
 
 @lru_cache(maxsize=50)
 def chat_with_gemini_cached(prompt):
-    """Cached version for repeated prompts"""
     return chat_with_gemini(prompt)
 
 def chat_with_gemini(prompt):
-    """Main chat function with timing"""
     start_time = time.time()
     
     scraped = get_cached_session()
@@ -395,7 +390,6 @@ def chat_with_gemini(prompt):
 # ============================================
 
 def save_chat(question, response, time_taken):
-    """Save chat to database"""
     try:
         conn = get_db()
         if conn:
@@ -413,7 +407,6 @@ def save_chat(question, response, time_taken):
         return False
 
 def get_chat_history(limit=100):
-    """Get chat history"""
     try:
         conn = get_db()
         if conn:
@@ -439,7 +432,6 @@ def get_chat_history(limit=100):
         return []
 
 def clear_chat_history():
-    """Clear all chat history"""
     try:
         conn = get_db()
         if conn:
@@ -461,7 +453,7 @@ def clear_chat_history():
 def home():
     """API Information"""
     return jsonify({
-        'name': 'TOXIC Chat API',
+        'name': 'KAL-X Chat API',
         'owner': 'Tomar Ji',
         'version': '2.0.0',
         'status': 'Online',
@@ -492,7 +484,6 @@ def home():
 
 @app.route('/chat', methods=['GET'])
 def chat():
-    """Chat endpoint - Use /chat?q=your question"""
     question = request.args.get('q', '').strip()
     
     if not question:
@@ -534,7 +525,6 @@ def chat():
 
 @app.route('/history', methods=['GET'])
 def history():
-    """Get chat history"""
     limit = request.args.get('limit', 100, type=int)
     history = get_chat_history(limit)
     
@@ -547,7 +537,6 @@ def history():
 
 @app.route('/clear', methods=['GET'])
 def clear():
-    """Clear chat history"""
     if clear_chat_history():
         return jsonify({
             'success': True,
@@ -563,12 +552,10 @@ def clear():
 
 @app.route('/stats', methods=['GET'])
 def stats():
-    """Get chat statistics"""
     try:
         conn = get_db()
         if conn:
             c = conn.cursor()
-            
             c.execute("SELECT COUNT(*) as total FROM chats")
             total = c.fetchone()
             
@@ -580,7 +567,6 @@ def stats():
             
             c.execute("SELECT MAX(time_taken) as slowest FROM chats")
             slowest = c.fetchone()
-            
             conn.close()
             
             return jsonify({
@@ -608,7 +594,6 @@ def stats():
 
 @app.route('/clear-all', methods=['GET'])
 def clear_all():
-    """Clear all data including database"""
     try:
         conn = get_db()
         if conn:
@@ -636,7 +621,6 @@ def clear_all():
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    """Ping endpoint for testing"""
     return jsonify({
         'success': True,
         'message': 'Pong!',
@@ -681,45 +665,11 @@ def ratelimit_error(error):
     }), 429
 
 # ============================================
-# VERCEL COMPATIBLE - This is the handler
-# ============================================
-
-# For Vercel, we need to expose 'app' as the handler
-# No changes needed - Vercel automatically detects Flask
-
-# ============================================
 # MAIN - For Local Testing
 # ============================================
 
 if __name__ == '__main__':
-    print('\n' + '='*60)
-    print(' TOXIC - FAST CHAT API (VERCEL READY)')
-    print(' Owner: Tomar Ji')
-    print('='*60)
-    print('\n HOW TO USE:')
-    print('  http://localhost:5000/chat?q=Hello')
-    print('  http://localhost:5000/chat?q=How are you?')
-    print('  http://localhost:5000/chat?q=What is your name?')
-    print('\n OTHER ENDPOINTS:')
-    print('  GET  /          - API Info')
-    print('  GET  /chat?q=   - Send Message')
-    print('  GET  /history   - Get History')
-    print('  GET  /clear     - Clear History')
-    print('  GET  /stats     - Get Stats')
-    print('  GET  /ping      - Ping Test')
-    print('='*60)
-    print('\n EXAMPLE:')
-    print('  http://localhost:5000/chat?q=Hello baby')
-    print('='*60)
-    
-    # Initialize database
     init_database()
-    
-    print('\n Starting Fast Chat API...\n')
-    print(' Open in browser: http://localhost:5000')
-    print(' Try: http://localhost:5000/chat?q=Hello')
-    print('='*60 + '\n')
-    
     app.run(
         debug=False,
         host='0.0.0.0',
