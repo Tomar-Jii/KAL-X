@@ -335,7 +335,7 @@ def clear_chat_history():
         return False
 
 # ============================================
-# WEB UI TEMPLATE (MODERN DARK THEME)
+# WEB UI TEMPLATE
 # ============================================
 
 HTML_UI = """<!DOCTYPE html>
@@ -468,7 +468,7 @@ HTML_UI = """<!DOCTYPE html>
 
   <div id="chat-container">
     <div class="bubble bot-bubble">
-      Hello! Main KAL-X AI hoon. Main aapki kya madad kar sakta hoon?
+      Yo! Main KAL-X AI hoon — created by Tomar Ji. Boliye, kya madad karu aaj?
     </div>
   </div>
 
@@ -540,7 +540,7 @@ HTML_UI = """<!DOCTYPE html>
     function clearUI() {
       chatContainer.innerHTML = `
         <div class="bubble bot-bubble">
-          Chat cleared. Poochein apna sawaal!
+          Chat cleared. Boliye kya baat karni hai!
         </div>
       `;
     }
@@ -585,7 +585,17 @@ def chat():
     if not check_rate_limit(ip, limit=100, window=60):
         return jsonify({'success': False, 'error': 'Rate limit exceeded!', 'owner': 'Tomar Ji'}), 429
     
-    result = chat_with_gemini(question)
+    # ── Inject Persona Prompt ──────────────────────────────────────────────
+    system_prompt = (
+        "[System Instruction: You are KAL-X AI, a super intelligent, witty, friendly, and cool AI persona. "
+        "Your CREATOR, DEVELOPER, and OWNER is 'Tomar Ji'. "
+        "Strict Rule: If someone asks who created you, who your developer is, or who your owner is, "
+        "you must explicitly and proudly say that your owner and creator is 'Tomar Ji'. Never say Google created you. "
+        "Talk naturally in conversational Hinglish or English matching the user. Be friendly, slightly humorous, and authentic like a close buddy.]\n\n"
+        f"User Message: {question}"
+    )
+
+    result = chat_with_gemini(system_prompt)
     if result['success']:
         save_chat(question, result['response'], result['time_taken'])
         return jsonify({
