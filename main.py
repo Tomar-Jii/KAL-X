@@ -1,383 +1,728 @@
-import asyncio
-import glob
+# ============================================
+# 🚀 TOXIC - FAST CHAT API FOR VERCEL 🚀
+# Developer: Tomar Ji
+# Ready for Vercel Deployment
+# ============================================
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
 import json
+import re
+import uuid
+import time
+import sqlite3
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+import logging
+from datetime import datetime
+from functools import lru_cache
+from bs4 import BeautifulSoup
+from collections import defaultdict
 
-import duckdb
-import gradio as gr
-import httpx  # <-- added for pinger
-from fastapi import FastAPI, HTTPException, Query, Response
-from pydantic import BaseModel
+# ============================================
+# APP INITIALIZATION
+# ============================================
 
-# ── Config ──────────────────────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
-HF_INDEX_BASE = os.environ.get(
-    "ICMR_HF_INDEX_BASE",
-    "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main",
-).rstrip("/")
-INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
-THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
-DUPLICATE_CAP = 2
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'TOXIC-chat-api-2026'
+CORS(app, origins='*')
 
-SEARCH_FIELDS = [
-    "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
-    "address", "district", "pincode", "state", "town", "source",
-]
-NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
+# Rate limiting
+rate_limits = defaultdict(list)
 
-IDX_PHONE = "idx_phone"
-IDX_AADHAR = "idx_aadhar"
+def check_rate_limit(ip, limit=100, window=60):
+    now = time.time()
+    rate_limits[ip] = [t for t in rate_limits[ip] if t > now - window]
+    if len(rate_limits[ip]) >= limit:
+        return False
+    rate_limits[ip].append(now)
+    return True
 
-REMOTE_INDEXES = {
-    "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
-    "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# DATABASE SETUP (SQLite for Vercel)
+# ============================================
+
+def init_database():
+    try:
+        # Use /tmp for Vercel (writable directory)
+        db_path = '/tmp/TOXIC_chat.db'
+        if not os.path.exists(db_path):
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT NOT NULL,
+                response TEXT NOT NULL,
+                time_taken REAL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )''')
+            
+            conn.commit()
+            conn.close()
+            logger.info("Database initialized!")
+        return db_path
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+        return None
+
+DB_PATH = init_database()
+
+def get_db():
+    if DB_PATH:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    return None
+
+# ============================================
+# GEMINI API - OPTIMIZED
+# ============================================
+
+# Session cache for speed
+session_cache = {
+    'data': None,
+    'timestamp': 0,
+    'ttl': 300
 }
 
-# ── DuckDB Connection Pool ──────────────────────────────────────────────────
-_conns: list[duckdb.DuckDBPyConnection] = []
-_conns_lock = threading.Lock()
-_thread_local = threading.local()
-pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
+def extract_snlm0e_token(html):
+    patterns = [
+        r'"SNlM0e":"([^"]+)"',
+        r"'SNlM0e':'([^']+)'",
+        r'SNlM0e["\']?\\s*[:=]\\s*["\']([^"\']+)["\']',
+        r'"FdrFJe":"([^"]+)"',
+        r"'FdrFJe':'([^']+)'",
+        r'FdrFJe["\']?\\s*[:=]\\s*["\']([^"\']+)["\']',
+        r'"cfb2h":"([^"]+)"',
+        r"'cfb2h':'([^']+)'",
+        r'cfb2h["\']?\\s*[:=]\\s*["\']([^"\']+)["\']',
+        r'at["\']?\\s*[:=]\\s*["\']([^"\']{50,})["\']',
+        r'"at":"([^"]+)"',
+        r'"token":"([^"]+)"',
+        r'data-token["\']?\\s*=\\s*["\']([^"\']+)["\']',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            token = match.group(1)
+            if len(token) > 20:
+                return token
+    return None
 
+def extract_from_script_tags(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    for script in soup.find_all('script'):
+        if script.string:
+            if 'SNlM0e' in script.string or 'FdrFJe' in script.string:
+                token = extract_snlm0e_token(script.string)
+                if token:
+                    return token
+    return None
 
-def _idx_ready(kind: str) -> bool:
-    return kind in REMOTE_INDEXES
+def extract_build_and_session_params(html):
+    params = {}
+    
+    bl_match = re.search(r'bl["\']?\\s*[:=]\\s*["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if bl_match:
+        params['bl'] = bl_match.group(1)
+    
+    fsid_match = re.search(r'f\\.sid["\']?\\s*[:=]\\s*["\']?([^"\'&\\s]+)', html, re.IGNORECASE)
+    if fsid_match:
+        params['fsid'] = fsid_match.group(1)
+    
+    reqid_match = re.search(r'_reqid["\']?\\s*[:=]\\s*["\']?(\\d+)', html)
+    if reqid_match:
+        params['reqid'] = int(reqid_match.group(1))
+    
+    if not params.get('bl'):
+        params['bl'] = 'boq_assistant-bard-web-server_20251217.07_p5'
+    if not params.get('fsid'):
+        params['fsid'] = str(-1 * int(time.time() * 1000))
+    if not params.get('reqid'):
+        params['reqid'] = int(time.time() * 1000) % 1000000
+    
+    return params
 
-
-def _new_conn() -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect()
-    # Vercel fix: set home & extension dir to /tmp
-    con.execute("SET home_directory='/tmp'")
-    con.execute("SET extension_directory='/tmp/duckdb_extensions'")
-    con.execute("INSTALL parquet; LOAD parquet;")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    # Create sorted index views from remote HF parts
-    for kind, urls in REMOTE_INDEXES.items():
-        view = f"people_{kind}"
-        lst = ", ".join(f"'{u}'" for u in urls)
-        con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
-    con.execute(f"SET threads = {THREADS_PER_CONN}")
-    return con
-
-
-def _thread_id() -> int:
-    tid = getattr(_thread_local, "id", None)
-    if tid is None:
-        with _conns_lock:
-            tid = len(_conns)
-            _thread_local.id = tid
-    return tid
-
-
-def _get_conn() -> duckdb.DuckDBPyConnection:
-    ident = _thread_id()
-    with _conns_lock:
-        while len(_conns) <= ident:
-            _conns.append(_new_conn())
-    return _conns[ident]
-
-
-# ── Dedup & Connected Records ───────────────────────────────────────────────
-def _person_key(row: dict) -> tuple:
-    ph = (row.get("phoneNumber") or "").strip()
-    ad = (row.get("aadharNumber") or "").strip()
-    if ph or ad:
-        return (ph, ad)
-    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
-
-
-def _connected_numbers(row: dict) -> list[dict]:
-    connected, seen = [], set()
-    for field in NUMBER_FIELDS:
-        raw = row.get(field)
-        if raw is None:
-            continue
-        value = str(raw).strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        connected.append({"field": field, "value": value})
-    return connected
-
-
-def _cap_duplicates(rows: list[dict]) -> list[dict]:
-    seen: dict[tuple, int] = {}
-    out = []
-    for r in rows:
-        k = _person_key(r)
-        n = seen.get(k, 0)
-        if n < DUPLICATE_CAP:
-            seen[k] = n + 1
-            record = dict(r)
-            record["connected_numbers"] = _connected_numbers(record)
-            out.append(record)
-    return out
-
-
-# ── Search Logic ────────────────────────────────────────────────────────────
-def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
-    if field not in SEARCH_FIELDS:
-        raise ValueError(f"Unknown field: {field}")
-    v = value.replace("'", "''")
-
-    if mode == "exact":
-        if field == "phoneNumber" and _idx_ready("phone"):
-            view = "people_phone"
-        elif field == "aadharNumber" and _idx_ready("aadhar"):
-            view = "people_aadhar"
-        elif field == "otherNumber":
-            # otherNumber not sorted — skip to avoid slow scan
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
-    elif mode == "contains":
-        if field == "name":
-            # Name search not available in remote-only mode
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
-    con = _get_conn()
-    rows = con.execute(sql).fetchall()
-    cols = [d[0] for d in con.description]
-    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
-
-
-def _unified_search(q: str, limit: int = 10) -> dict:
-    q = q.strip()
-    is_num = q.isdigit() and len(q) >= 8
-
-    if is_num:
-        all_rows = []
-        searched = []
-        # Phone index first (fast)
-        if _idx_ready("phone"):
-            r = _run_field_search("phoneNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("phoneNumber")
-        # Aadhar index second
-        if not all_rows and _idx_ready("aadhar"):
-            r = _run_field_search("aadharNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("aadharNumber")
-        all_rows = _cap_duplicates(all_rows)[:limit]
-        return {
-            "query": q, "searched_fields": searched,
-            "count": len(all_rows), "results": all_rows,
+def get_cached_session():
+    """Get cached session for speed"""
+    current_time = time.time()
+    if session_cache['data'] and (current_time - session_cache['timestamp']) < session_cache['ttl']:
+        return session_cache['data']
+    
+    session = requests.Session()
+    url = 'https://gemini.google.com/app'
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'cache-control': 'no-cache'
+    }
+    
+    try:
+        response = session.get(url, headers=headers, timeout=15)
+        html = response.text
+        
+        cookies = {}
+        for cookie in session.cookies:
+            cookies[cookie.name] = cookie.value
+        
+        snlm0e = extract_snlm0e_token(html)
+        if not snlm0e:
+            snlm0e = extract_from_script_tags(html)
+        if not snlm0e:
+            return None
+        
+        params = extract_build_and_session_params(html)
+        
+        session_data = {
+            'session': session,
+            'cookies': cookies,
+            'snlm0e': snlm0e,
+            'bl': params['bl'],
+            'fsid': params['fsid'],
+            'reqid': params['reqid']
         }
-    else:
-        return {"query": q, "searched_fields": [], "count": 0, "results": []}
+        
+        session_cache['data'] = session_data
+        session_cache['timestamp'] = current_time
+        
+        return session_data
+    except Exception as e:
+        logger.error(f"Session error: {e}")
+        return None
 
-
-# ── FastAPI (for API access) ────────────────────────────────────────────────
-fastapi_app = FastAPI(title="ICMR + HITEK Search API")
-
-
-class BatchRequest(BaseModel):
-    queries: list[dict[str, Any]]
-    limit: int = 10
-
-
-@fastapi_app.get("/")
-def root():
+def build_payload(prompt, snlm0e):
+    escaped_prompt = prompt.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+    session_id = uuid.uuid4().hex
+    request_uuid = str(uuid.uuid4()).upper()
+    
+    payload_data = [
+        [escaped_prompt, 0, None, None, None, None, 0],
+        ["en-US"],
+        ["", "", "", None, None, None, None, None, None, ""],
+        snlm0e,
+        session_id,
+        None,
+        [0],
+        1,
+        None,
+        None,
+        1,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        [[0]],
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        1,
+        None,
+        None,
+        [4],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        [2],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        request_uuid,
+        None,
+        []
+    ]
+    
+    payload_str = json.dumps(payload_data, separators=(',', ':'))
+    escaped_payload = payload_str.replace('\\', '\\\\').replace('"', '\\"')
+    
     return {
-        "app": "ICMR + HITEK Search API",
-        "records": 2_504_793_870,
-        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
-        "columns": SEARCH_FIELDS,
-        "docs": "/docs",
-        "developer": "Tomar Ji",
+        'f.req': f'[null,"{escaped_payload}"]',
+        '': ''
     }
 
+def parse_streaming_response(response_text):
+    lines = response_text.strip().split('\n')
+    full_text = ""
+    
+    for line in lines:
+        if not line or line.startswith(')]}'):
+            continue
+        try:
+            if line.isdigit():
+                continue
+            data = json.loads(line)
+            if isinstance(data, list) and len(data) > 0:
+                if data[0][0] == "wrb.fr" and len(data[0]) > 2:
+                    inner_json = data[0][2]
+                    if inner_json:
+                        parsed = json.loads(inner_json)
+                        if isinstance(parsed, list) and len(parsed) > 4:
+                            content_array = parsed[4]
+                            if isinstance(content_array, list) and len(content_array) > 0:
+                                first_item = content_array[0]
+                                if isinstance(first_item, list) and len(first_item) > 0:
+                                    response_id = first_item[0]
+                                    if isinstance(response_id, str) and response_id.startswith('rc_'):
+                                        if len(first_item) > 1 and isinstance(first_item[1], list):
+                                            text_array = first_item[1]
+                                            if len(text_array) > 0:
+                                                text_content = text_array[0]
+                                                if isinstance(text_content, str) and len(text_content) > len(full_text):
+                                                    full_text = text_content
+        except:
+            continue
+    
+    if full_text:
+        full_text = full_text.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+    return full_text if full_text else None
 
-@fastapi_app.get("/health")
-def health():
-    return {"status": "ok", "raw_database_required": False,
-            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-            "index_source": INDEX_SOURCE}
+@lru_cache(maxsize=50)
+def chat_with_gemini_cached(prompt):
+    """Cached version for repeated prompts"""
+    return chat_with_gemini(prompt)
 
-
-@fastapi_app.get("/search")
-async def search(
-    q: str | None = Query(None),
-    mobile: str | None = Query(None),
-    field: str | None = Query(None),
-    mode: str = Query("exact"),
-    limit: int = Query(10, ge=1, le=1000),
-    pretty: bool = Query(True),
-):
-    q_val = (q or mobile or "").strip()
-    if not q_val:
-        raise HTTPException(422, "Provide q or mobile")
-    loop = asyncio.get_running_loop()
-    if field:
-        data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
-    else:
-        data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
-    result = {"success": bool(data["count"]), **data, "number": q_val,
-              "total": data["count"]}
-    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
-    return Response(content=content, media_type="application/json")
-
-
-@fastapi_app.post("/search/parallel")
-async def search_parallel(req: BatchRequest):
-    if not req.queries:
-        raise HTTPException(400, "queries must not be empty")
-    if len(req.queries) > 50:
-        raise HTTPException(400, "max 50 queries per batch")
-    loop = asyncio.get_running_loop()
-    tasks = [
-        loop.run_in_executor(pool, _run_field_search,
-                             item.get("field", "phoneNumber"),
-                             item.get("value", ""),
-                             item.get("mode", "exact"),
-                             int(item.get("limit", req.limit)))
-        for item in req.queries
-    ]
-    results = await asyncio.gather(*tasks)
-    return Response(content=json.dumps({"searches": len(req.queries), "results": list(results)},
-                                       indent=2, ensure_ascii=False),
-                    media_type="application/json")
-
-
-# ── Pinger (keeps app alive) ──────────────────────────────────────────────
-async def pinger():
-    """Ping the /health endpoint every 2 minutes to prevent idle shutdown."""
-    port = os.getenv("PORT", "7860")  # default Gradio port; change if needed
-    url = f"http://localhost:{port}/health"
-    async with httpx.AsyncClient(timeout=10) as client:
-        while True:
-            await asyncio.sleep(120)  # 2 minutes
-            try:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    print(f"[Pinger] OK at {asyncio.get_event_loop().time()}")
-                else:
-                    print(f"[Pinger] Unexpected status: {resp.status_code}")
-            except Exception as e:
-                print(f"[Pinger] Error: {e}")
-
-
-@fastapi_app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(pinger())
-
-
-# ── Gradio UI ───────────────────────────────────────────────────────────────
-def format_result(row: dict) -> str:
-    """Format a single result record as readable text."""
-    lines = []
-    for field in SEARCH_FIELDS:
-        val = row.get(field, "")
-        if val:
-            lines.append(f"**{field}:** {val}")
-    # Connected numbers
-    cn = row.get("connected_numbers", [])
-    if cn:
-        nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
-        lines.append(f"**connected:** {nums}")
-    return "\n\n".join(lines)
-
-
-def search_ui(query: str, limit: int) -> str:
-    """Main Gradio search function."""
-    if not query or not query.strip():
-        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
-
-    q = query.strip()
+def chat_with_gemini(prompt):
+    """Main chat function with timing"""
+    start_time = time.time()
+    
+    scraped = get_cached_session()
+    if not scraped:
+        return {
+            'success': False,
+            'error': 'Failed to connect! Try again!',
+            'time_taken': 0
+        }
+    
+    session = scraped['session']
+    cookies = scraped['cookies']
+    snlm0e = scraped['snlm0e']
+    bl = scraped['bl']
+    fsid = scraped['fsid']
+    reqid = scraped['reqid']
+    
+    base_url = "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
+    url = f"{base_url}?bl={bl}&f.sid={fsid}&hl=en-US&_reqid={reqid}&rt=c"
+    
+    payload = build_payload(prompt, snlm0e)
+    cookie_str = '; '.join([f"{k}={v}" for k, v in cookies.items()])
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'x-same-domain': '1',
+        'origin': 'https://gemini.google.com',
+        'referer': 'https://gemini.google.com/',
+        'Cookie': cookie_str
+    }
+    
     try:
-        data = _unified_search(q, int(limit))
+        response = session.post(url, data=payload, headers=headers, timeout=30)
+        
+        if response.status_code != 200:
+            return {
+                'success': False,
+                'error': f'Error {response.status_code}!',
+                'time_taken': round(time.time() - start_time, 3)
+            }
+        
+        result = parse_streaming_response(response.text)
+        time_taken = round(time.time() - start_time, 3)
+        
+        if result:
+            return {
+                'success': True,
+                'response': result,
+                'time_taken': time_taken
+            }
+        else:
+            return {
+                'success': False,
+                'error': 'No response! Try again!',
+                'time_taken': time_taken
+            }
+            
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        logger.error(f"Chat error: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'time_taken': round(time.time() - start_time, 3)
+        }
 
-    count = data["count"]
-    results = data["results"]
-    searched = ", ".join(data.get("searched_fields", []))
+# ============================================
+# SAVE CHAT HISTORY (Vercel Compatible)
+# ============================================
 
-    if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
+def save_chat(question, response, time_taken):
+    """Save chat to database"""
+    try:
+        conn = get_db()
+        if conn:
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO chats (question, response, time_taken, timestamp) VALUES (?, ?, ?, ?)",
+                (question, response, time_taken, datetime.now())
+            )
+            conn.commit()
+            conn.close()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Save error: {e}")
+        return False
 
-    header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
-    parts = []
-    for i, row in enumerate(results, 1):
-        parts.append(f"### Result {i}\n{format_result(row)}")
-    return header + "\n\n---\n\n".join(parts)
+def get_chat_history(limit=100):
+    """Get chat history"""
+    try:
+        conn = get_db()
+        if conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT id, question, response, time_taken, timestamp FROM chats ORDER BY timestamp DESC LIMIT ?",
+                (limit,)
+            )
+            history = []
+            for row in c.fetchall():
+                history.append({
+                    'id': row['id'],
+                    'question': row['question'],
+                    'response': row['response'],
+                    'time_taken': row['time_taken'],
+                    'timestamp': row['timestamp']
+                })
+            conn.close()
+            return history
+        return []
+    except Exception as e:
+        logger.error(f"History error: {e}")
+        return []
 
+def clear_chat_history():
+    """Clear all chat history"""
+    try:
+        conn = get_db()
+        if conn:
+            c = conn.cursor()
+            c.execute("DELETE FROM chats")
+            conn.commit()
+            conn.close()
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Clear error: {e}")
+        return False
 
-def build_ui():
-    with gr.Blocks(
-        title="ICMR Search API",
-        theme=gr.themes.Soft(),
-        css="""
-        .main-title { text-align: center; margin-bottom: 0; }
-        .subtitle { text-align: center; color: #666; margin-top: 0; }
-        .footer { text-align: center; color: #888; margin-top: 20px; }
-        """
-    ) as demo:
-        gr.Markdown("# 🔍 ICMR + HITEK Search API", elem_classes="main-title")
-        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more", elem_classes="subtitle")
+# ============================================
+# API ENDPOINTS
+# ============================================
 
-        with gr.Row():
-            with gr.Column(scale=3):
-                query_input = gr.Textbox(
-                    label="Search Query",
-                    placeholder="Phone number, Aadhaar, ya name daalo...",
-                    lines=1,
-                )
-            with gr.Column(scale=1):
-                limit_slider = gr.Slider(
-                    minimum=1, maximum=50, value=10, step=1,
-                    label="Max Results",
-                )
+@app.route('/', methods=['GET'])
+def home():
+    """API Information"""
+    return jsonify({
+        'name': 'TOXIC Chat API',
+        'owner': 'Tomar Ji',
+        'version': '2.0.0',
+        'status': 'Online',
+        'deployment': 'Vercel',
+        'usage': {
+            'chat': {
+                'method': 'GET',
+                'url': '/chat?q=your question',
+                'example': '/chat?q=Hello how are you?'
+            },
+            'history': {
+                'method': 'GET',
+                'url': '/history',
+                'example': '/history'
+            },
+            'stats': {
+                'method': 'GET',
+                'url': '/stats',
+                'example': '/stats'
+            },
+            'clear': {
+                'method': 'GET',
+                'url': '/clear',
+                'example': '/clear'
+            }
+        }
+    })
 
-        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
-        output = gr.Markdown(label="Results")
+@app.route('/chat', methods=['GET'])
+def chat():
+    """Chat endpoint - Use /chat?q=your question"""
+    question = request.args.get('q', '').strip()
+    
+    if not question:
+        return jsonify({
+            'success': False,
+            'error': 'Question is required! Use ?q=your question',
+            'owner': 'Tomar Ji',
+            'usage': '/chat?q=Hello how are you?'
+        }), 400
+    
+    ip = request.remote_addr
+    if not check_rate_limit(ip, limit=100, window=60):
+        return jsonify({
+            'success': False,
+            'error': 'Rate limit exceeded! Wait a moment!',
+            'owner': 'Tomar Ji'
+        }), 429
+    
+    result = chat_with_gemini(question)
+    
+    if result['success']:
+        save_chat(question, result['response'], result['time_taken'])
+        
+        return jsonify({
+            'success': True,
+            'question': question,
+            'response': result['response'],
+            'time_taken': f"{result['time_taken']} seconds",
+            'owner': 'Tomar Ji',
+            'timestamp': datetime.now().isoformat()
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': result.get('error', 'Something went wrong!'),
+            'time_taken': f"{result.get('time_taken', 0)} seconds",
+            'owner': 'Tomar Ji'
+        }), 500
 
-        search_btn.click(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
-        )
-        query_input.submit(
-            fn=search_ui,
-            inputs=[query_input, limit_slider],
-            outputs=output,
-        )
+@app.route('/history', methods=['GET'])
+def history():
+    """Get chat history"""
+    limit = request.args.get('limit', 100, type=int)
+    history = get_chat_history(limit)
+    
+    return jsonify({
+        'success': True,
+        'count': len(history),
+        'history': history,
+        'owner': 'Tomar Ji'
+    })
 
-        gr.Markdown("---")
-        with gr.Accordion("📡 API Info", open=False):
-            gr.Markdown("""
-**Endpoints** (via FastAPI):
-- `GET /search?q=<number>` — Phone/Aadhaar search
-- `GET /search?mobile=<number>` — Phone search (alias)
-- `GET /health` — Health check
-- `GET /docs` — Swagger UI
+@app.route('/clear', methods=['GET'])
+def clear():
+    """Clear chat history"""
+    if clear_chat_history():
+        return jsonify({
+            'success': True,
+            'message': 'Chat history cleared!',
+            'owner': 'Tomar Ji'
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': 'Failed to clear history!',
+            'owner': 'Tomar Ji'
+        }), 500
 
-**Source:** [HF Dataset](https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed)
-            """)
+@app.route('/stats', methods=['GET'])
+def stats():
+    """Get chat statistics"""
+    try:
+        conn = get_db()
+        if conn:
+            c = conn.cursor()
+            
+            c.execute("SELECT COUNT(*) as total FROM chats")
+            total = c.fetchone()
+            
+            c.execute("SELECT AVG(time_taken) as avg_time FROM chats")
+            avg_time = c.fetchone()
+            
+            c.execute("SELECT MIN(time_taken) as fastest FROM chats")
+            fastest = c.fetchone()
+            
+            c.execute("SELECT MAX(time_taken) as slowest FROM chats")
+            slowest = c.fetchone()
+            
+            conn.close()
+            
+            return jsonify({
+                'success': True,
+                'stats': {
+                    'total_chats': total['total'] if total else 0,
+                    'average_response_time': f"{avg_time['avg_time']:.3f} seconds" if avg_time and avg_time['avg_time'] else '0 seconds',
+                    'fastest_response': f"{fastest['fastest']:.3f} seconds" if fastest and fastest['fastest'] else '0 seconds',
+                    'slowest_response': f"{slowest['slowest']:.3f} seconds" if slowest and slowest['slowest'] else '0 seconds'
+                },
+                'owner': 'Tomar Ji'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Database not available',
+                'owner': 'Tomar Ji'
+            }), 500
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'owner': 'Tomar Ji'
+        }), 500
 
-        # Developer credit footer
-        gr.Markdown(
-            "---\n"
-            "<div class='footer'>"
-            "👨‍💻 **Developer:** Tomar Ji"
-            "</div>",
-            elem_classes="footer"
-        )
+@app.route('/clear-all', methods=['GET'])
+def clear_all():
+    """Clear all data including database"""
+    try:
+        conn = get_db()
+        if conn:
+            c = conn.cursor()
+            c.execute("DROP TABLE IF EXISTS chats")
+            conn.commit()
+            conn.close()
+            init_database()
+            return jsonify({
+                'success': True,
+                'message': 'All data cleared! Database reset!',
+                'owner': 'Tomar Ji'
+            })
+        return jsonify({
+            'success': False,
+            'error': 'Database not available',
+            'owner': 'Tomar Ji'
+        }), 500
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'owner': 'Tomar Ji'
+        }), 500
 
-    return demo
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Ping endpoint for testing"""
+    return jsonify({
+        'success': True,
+        'message': 'Pong!',
+        'owner': 'Tomar Ji',
+        'timestamp': datetime.now().isoformat()
+    })
 
+# ============================================
+# ERROR HANDLERS
+# ============================================
 
-# ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
-demo = build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        'success': False,
+        'error': 'Endpoint not found! Use /chat?q=your question',
+        'owner': 'Tomar Ji',
+        'available_endpoints': [
+            '/',
+            '/chat?q=question',
+            '/history',
+            '/stats',
+            '/clear',
+            '/ping'
+        ]
+    }), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({
+        'success': False,
+        'error': 'Internal server error! Try again!',
+        'owner': 'Tomar Ji'
+    }), 500
+
+@app.errorhandler(429)
+def ratelimit_error(error):
+    return jsonify({
+        'success': False,
+        'error': 'Too many requests! Slow down!',
+        'owner': 'Tomar Ji'
+    }), 429
+
+# ============================================
+# VERCEL COMPATIBLE - This is the handler
+# ============================================
+
+# For Vercel, we need to expose 'app' as the handler
+# No changes needed - Vercel automatically detects Flask
+
+# ============================================
+# MAIN - For Local Testing
+# ============================================
+
+if __name__ == '__main__':
+    print('\n' + '='*60)
+    print(' TOXIC - FAST CHAT API (VERCEL READY)')
+    print(' Owner: Tomar Ji')
+    print('='*60)
+    print('\n HOW TO USE:')
+    print('  http://localhost:5000/chat?q=Hello')
+    print('  http://localhost:5000/chat?q=How are you?')
+    print('  http://localhost:5000/chat?q=What is your name?')
+    print('\n OTHER ENDPOINTS:')
+    print('  GET  /          - API Info')
+    print('  GET  /chat?q=   - Send Message')
+    print('  GET  /history   - Get History')
+    print('  GET  /clear     - Clear History')
+    print('  GET  /stats     - Get Stats')
+    print('  GET  /ping      - Ping Test')
+    print('='*60)
+    print('\n EXAMPLE:')
+    print('  http://localhost:5000/chat?q=Hello baby')
+    print('='*60)
+    
+    # Initialize database
+    init_database()
+    
+    print('\n Starting Fast Chat API...\n')
+    print(' Open in browser: http://localhost:5000')
+    print(' Try: http://localhost:5000/chat?q=Hello')
+    print('='*60 + '\n')
+    
+    app.run(
+        debug=False,
+        host='0.0.0.0',
+        port=5000,
+        threaded=True
+    )
